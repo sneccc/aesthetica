@@ -2,3 +2,4 @@ data/
 .data/*
 tests/old
 tests/brython
+**/__pycache__**
