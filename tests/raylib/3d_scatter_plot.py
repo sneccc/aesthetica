@@ -6,6 +6,7 @@ from utils import load_embeddings_and_paths
 import numpy as np
 import os
 import pacmap
+
 #current directory
 current_dir = os.path.dirname(os.path.abspath(__file__))
 #font = load_font_ex(os.path.join(current_dir, "../../resources/fonts/Roboto-Regular.ttf").encode(), 24, 0, 0)
@@ -142,20 +143,15 @@ while not window_should_close():   # Detect window close button or ESC key
             is_hit.append({"hit":True, "label":labels[i]})
             
             if is_mouse_button_pressed(MouseButton.MOUSE_BUTTON_LEFT):
-                camera_to_target_direction = vector3_subtract(closest_billboard, camera.position)
-                camera_to_target_direction_normalized = vector3_normalize(camera_to_target_direction)
-                camera.position=closest_collision_point
-                camera.position = vector3_subtract(camera.position, vector3_scale(camera_to_target_direction_normalized, 5))
-                camera.target = closest_billboard
-                
-                
-                
+                distance_to_billboard = vector3_length(vector3_subtract(closest_billboard, camera.position))
+                if distance_to_billboard > 5.5:
+                    camera_to_target_direction = vector3_subtract(closest_billboard, camera.position)
+                    camera_to_target_direction_normalized = vector3_normalize(camera_to_target_direction)
+                    camera.position = vector3_subtract(closest_collision_point, vector3_scale(camera_to_target_direction_normalized, 5))
+                    camera.target = closest_billboard 
         else:
             draw_billboard(camera, textures[i], billboard_position, 1, WHITE)
             
-
-
-
     # Draw debug ray
     draw_ray(ray, RED)
 
@@ -165,12 +161,17 @@ while not window_should_close():   # Detect window close button or ESC key
     #set_mouse_position(int(mouse_position.x), int(mouse_position.y))
     
     draw_fps(10, 10)
+
+    
     # Check if any billboard is hit and display its label
     hit_items = [item for item in is_hit if item["hit"]]
     if hit_items:
         # Get the label of the first hit item
         label = hit_items[0]["label"]
-        draw_text(f"Label: {label}", 10, 40, 25, RED)
+        screen_width = get_screen_width()
+        screen_height = get_screen_height()
+        #positioning the text middle of screen and at the bottom
+        draw_text(f"Label: {label}", screen_width//2-50, screen_height-30, 25, RED)
     
     #draw_text(f"Camera position: {camera.position.x}, {camera.position.y}, {camera.position.z}", 10, 40, 25, GREEN)
     #draw a circle in the center of the screen
