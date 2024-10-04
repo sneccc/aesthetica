@@ -89,6 +89,8 @@ def prepare_embeddings(root_directory, clip_models):
 
 if __name__ == "__main__":
     clip_model=[("hf-hub:timm","ViT-SO400M-14-SigLIP-384")]
-    root_directory = "data\\normalized_3d_test"
+    
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+    root_directory = os.path.join(current_dir, "../data/normalized_art_categories")
     
     image_embeddings, class_labels, file_paths = prepare_embeddings(root_directory, clip_model)

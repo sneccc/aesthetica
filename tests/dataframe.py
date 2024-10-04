@@ -4,6 +4,7 @@ import shutil
 from PIL import Image
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from tqdm import tqdm
+import argparse
 
 # Get the full path to the project root directory
 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
@@ -91,18 +92,25 @@ def create_image_dataframe(root_directory, output_directory):
     
     return df
 
-# Usage example
-root_directory = os.path.join(project_root, 'data/3d_test')
-output_directory = os.path.join(project_root, 'data/normalized_3d_test')
+def main():
+    parser = argparse.ArgumentParser(description="Process image dataset and create a DataFrame.")
+    parser.add_argument("-i", "--input_directory", required=True, help="Path to the input image directory")
+    args = parser.parse_args()
+    print(f"Input directory: {args.input_directory}")
+    root_directory = os.path.abspath(args.input_directory)
+    output_directory = os.path.join(os.path.dirname(root_directory), f"normalized_{os.path.basename(root_directory)}")
 
-image_df = create_image_dataframe(root_directory, output_directory)
+    image_df = create_image_dataframe(root_directory, output_directory)
 
-# Save the DataFrame to a CSV file
-csv_path = os.path.join(project_root, 'image_classifier_data.csv')
-image_df.to_csv(csv_path, index=False)
+    # Save the DataFrame to a CSV file
+    csv_path = os.path.join(project_root, 'image_classifier_data.csv')
+    image_df.to_csv(csv_path, index=False)
 
-# Print some information about the dataset
-print(f"Total images: {len(image_df)}")
-print(f"Training images: {len(image_df[~image_df['is_test']])}")
-print(f"Test images: {len(image_df[image_df['is_test']])}")
-print(f"Unique labels: {image_df['label_name'].nunique() - 1}")  # -1 to exclude test label
+    # Print some information about the dataset
+    print(f"Total images: {len(image_df)}")
+    print(f"Training images: {len(image_df[~image_df['is_test']])}")
+    print(f"Test images: {len(image_df[image_df['is_test']])}")
+    print(f"Unique labels: {image_df['label_name'].nunique() - 1}")  # -1 to exclude test label
+
+if __name__ == "__main__":
+    main()

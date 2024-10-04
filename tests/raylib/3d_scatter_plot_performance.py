@@ -4,6 +4,13 @@ from utils import load_embeddings_and_paths
 import numpy as np
 import os
 import pacmap
+import numpy as np
+from pyray import *
+import random
+from utils import load_embeddings_and_paths
+import os
+import umap
+from frustum_culling import Frustum  # Importing the Frustum
 
 #current directory
 current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -77,11 +84,19 @@ is_wire_mode = False
 SCREEN_CENTER = Vector2(screenWidth//2, screenHeight//2)
 
 is_Prespective=True
+
+# Initialize frustum
+frustum = Frustum(camera)
+
 # Main game loop
 while not window_should_close():   # Detect window close button or ESC key
     # Update
-    #distance = vector_3distance(camera.position, billboard_positions[0])
-    update_camera(camera,CameraMode.CAMERA_FREE)
+    update_camera(camera, CameraMode.CAMERA_FREE)
+    
+    # Update the frustum after the camera has been updated
+    frustum.camera = camera
+    frustum.update_frustum()
+
     # ==== Draw ====
     begin_drawing()
     clear_background(RAYWHITE)
@@ -91,81 +106,90 @@ while not window_should_close():   # Detect window close button or ESC key
     draw_grid(100, 2)
     
     if is_key_pressed(KeyboardKey.KEY_P):
-        is_Prespective=not is_Prespective
+        is_Prespective = not is_Prespective
         if is_Prespective:
             camera.projection = CameraProjection.CAMERA_PERSPECTIVE
         else:
             camera.projection = CameraProjection.CAMERA_ORTHOGRAPHIC
-    #draw a line from oposite of camera position to center of canvas
     
-    # ==== debug ray ====
-    camera_direction = vector3_subtract(camera.target, camera.position)  # Changed subtraction order
+    # Update camera direction for ray casting
+    camera_direction = vector3_subtract(camera.target, camera.position)
     camera_direction_normalized = vector3_normalize(camera_direction)
-    distance_in_front = 10.0  # Adjust this value to place the cube closer or farther
+    
+    # Position in front of the camera for the debug sphere
+    distance_in_front = 10.0
     infrontpos = vector3_add(camera.position, vector3_scale(camera_direction_normalized, distance_in_front))
     draw_sphere(infrontpos, 0.05, RED)
     
     shortest_distance = float('inf')
     closest_billboard = None
     closest_collision_point = None
-    is_hit = [{"hit":False, "label":None}]
+    is_hit = [{"hit": False, "label": None}]
     
-    # ==== Draw billboards ====
-    for i, (billboard_position, texture) in enumerate(zip(billboard_positions, textures)):
+    # Draw the frustum
+    frustum.draw_frustum_lines()
+
+    billboard_drawn = 0
+    for i in range(num_points):
+        billboard_position = billboard_positions[i]
+        texture = textures[i]
         
-        # Draw lines
-        # offset the line from the camera position
-        #draw_line_3d(billboard_position, camera.position, RED)
+         # Check if billboard's bounding sphere is inside the frustum
+        inside = frustum.contains_sphere(billboard_position, 1)
         
-        #size is 1x1x1
-        min = Vector3(billboard_position.x-0.5, billboard_position.y-0.5, billboard_position.z-0.5)
-        max = Vector3(billboard_position.x+0.5, billboard_position.y+0.5, billboard_position.z+0.5)
-    
+        if not inside:
+            continue  # Skip drawing this billboard
+        
+        billboard_drawn += 1
+        # Ray collision detection
+        min_bb = Vector3(billboard_position.x - 0.5, billboard_position.y - 0.5, billboard_position.z - 0.5)
+        max_bb = Vector3(billboard_position.x + 0.5, billboard_position.y + 0.5, billboard_position.z + 0.5)
+        
         ray.position = camera.position
         ray.direction = camera_direction_normalized
-
         
-        collision_info = get_ray_collision_box(ray, BoundingBox(min, max))
+        collision_info = get_ray_collision_box(ray, BoundingBox(min_bb, max_bb))
         
         if collision_info.hit:
             if collision_info.distance < shortest_distance:
                 shortest_distance = collision_info.distance
                 closest_billboard = billboard_position
                 closest_collision_point = collision_info.point
-                
-
+                closest_index = i  # Keep track of the index
+        
         # Apply effect to the closest billboard
         if closest_billboard is not None and collision_info.hit:
-            i = billboard_positions.index(closest_billboard)
-            draw_billboard(camera, textures[i], closest_billboard, 5, WHITE)
-            is_hit.append({"hit":True, "label":labels[i]})
-            
-            #Enlarge the billboard when left mouse button is pressed
-            if is_mouse_button_pressed(MouseButton.MOUSE_BUTTON_LEFT):
-                distance_to_billboard = vector3_length(vector3_subtract(closest_billboard, camera.position))
-                if distance_to_billboard > 5.5:
-                    camera_to_target_direction = vector3_subtract(closest_billboard, camera.position)
-                    camera_to_target_direction_normalized = vector3_normalize(camera_to_target_direction)
-                    camera.position = vector3_subtract(closest_collision_point, vector3_scale(camera_to_target_direction_normalized, 5))
-                    camera.target = closest_billboard
-            #Create lines from this to all billboards of the same label
-            if is_mouse_button_down(MouseButton.MOUSE_BUTTON_RIGHT):
-                for j, (billboard_position, texture) in enumerate(zip(billboard_positions, textures)):
-                    if labels[j] == labels[i]:
-                        draw_line_3d(closest_billboard, billboard_position, BLUE)
+            if i == closest_index:
+                draw_billboard(camera, textures[i], closest_billboard, 5, WHITE)
+                is_hit.append({"hit": True, "label": labels[i]})
+                
+                # Enlarge the billboard when left mouse button is pressed
+                if is_mouse_button_pressed(MouseButton.MOUSE_BUTTON_LEFT):
+                    distance_to_billboard = vector3_length(vector3_subtract(closest_billboard, camera.position))
+                    if distance_to_billboard > 5.5:
+                        camera_to_target_direction = vector3_subtract(closest_billboard, camera.position)
+                        camera_to_target_direction_normalized = vector3_normalize(camera_to_target_direction)
+                        camera.position = vector3_subtract(closest_collision_point, vector3_scale(camera_to_target_direction_normalized, 5))
+                        camera.target = closest_billboard
+                # Create lines to all billboards of the same label
+                if is_mouse_button_down(MouseButton.MOUSE_BUTTON_RIGHT):
+                    for j in range(num_points):
+                        if labels[j] == labels[i]:
+                            draw_line_3d(closest_billboard, billboard_positions[j], BLUE)
         else:
             draw_billboard(camera, textures[i], billboard_position, 1, WHITE)
-            
+    
     # Draw debug ray
-    draw_ray(ray, RED)
+    #draw_ray(ray, RED)
+    
 
+    
     # ==== End 3D ====
     end_mode_3d()
-
-    #set_mouse_position(int(mouse_position.x), int(mouse_position.y))
     
     draw_fps(10, 10)
-
+    #total number of billboards
+    draw_text(f"Total number of billboards drawn: {billboard_drawn}", 10, 40, 20, RED)
     
     # Check if any billboard is hit and display its label
     hit_items = [item for item in is_hit if item["hit"]]
@@ -173,23 +197,12 @@ while not window_should_close():   # Detect window close button or ESC key
         label = hit_items[0]["label"]
         screen_width = get_screen_width()
         screen_height = get_screen_height()
-        text = f"Label: {label}, name: {os.path.basename(thumbnail_paths[i])}"
+        text = f"Label: {label}, name: {os.path.basename(thumbnail_paths[closest_index])}"
         text_size = 25
-        text_width = measure_text(text, text_size)  # Use measure_text instead of text_length
+        text_width = measure_text(text, text_size)
         half_width = screen_width // 2
         half_width -= text_width // 2
         draw_text(text, half_width, screen_height - 30, text_size, RED)
-
-    #draw_text(f"Camera position: {camera.position.x}, {camera.position.y}, {camera.position.z}", 10, 40, 25, GREEN)
-    #draw a circle in the center of the screen
-    
-    # ==== Mouse and Keyboard Logic ====
-    # if(is_mouse_button_down(MouseButton.MOUSE_BUTTON_LEFT)):
-    #     draw_circle(int(get_mouse_position().x), int(get_mouse_position().y), 10, RED)
-    # else:
-    #     draw_circle(int(get_mouse_position().x), int(get_mouse_position().y), 10, BLUE) 
-    # ==== End Mouse Logic ====
-            
     
     # ==== End Draw ====
     end_drawing()
