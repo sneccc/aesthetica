@@ -6,6 +6,13 @@ import numpy as np
 from PIL import Image
 import os
 
+"""
+This file prepares embeddings for image data using CLIP models. It includes:
+
+• Support for multiple CLIP model architectures
+• Multi-threading for efficient image processing
+• Utility functions for embedding generation
+"""
 def prepare_embeddings(root_directory, clip_models):
     device = "cuda" if torch.cuda.is_available() else "cpu"
     # transform path into absolute path

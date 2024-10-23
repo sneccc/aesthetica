@@ -40,10 +40,10 @@ def main():
     # ==== Create billboard positions from the 3D embeddings and create a rectangle for each billboard and textures ====
     billboard_positions = [Vector3(point[0], point[1], point[2]) for point in embeddings_3d]
     
-     # After creating billboard_positions
     print("🐍 Clustering billboards")
-    n_clusters = len(billboard_positions) // 50  # Adjust this value as needed
-    kmeans = KMeans(n_clusters=n_clusters)
+    # Reduce the number of clusters
+    n_clusters = 5  # Adjust this value as needed
+    kmeans = KMeans(n_clusters=n_clusters, n_init=10)
     cluster_labels = kmeans.fit_predict(embeddings_3d)
     cluster_centers = kmeans.cluster_centers_
 
@@ -104,7 +104,7 @@ def main():
     
     
     #LOD
-    draw_distance_threshold = 10.0
+    draw_distance_threshold = 100.0
     # GL_TEXTURE_2D = 0x0DE1
     # GL_TEXTURE_LOD_BIAS = 0x8501
     # LOD_BIAS = -0.5 
@@ -147,14 +147,36 @@ def main():
         closest_collision_point = None
         is_hit = [{"hit":False, "label":None}]
         
-        # ==== Draw billboards ====
-        for i, (billboard_position, atlas_position) in enumerate(zip(billboard_positions, atlas_positions)):
-            if not frustum.sphere_in_frustum(billboard_position.x, billboard_position.y, billboard_position.z, 1):
-                continue
-            distance_to_camera = vector3_length(vector3_subtract(billboard_position, camera.position))
-            if distance_to_camera > draw_distance_threshold:
-                continue
+        # ===== Draw clusters =====
+        # cluster_radii = 10 # Adjust radius as needed
+        # for cluster_id, center in enumerate(cluster_centers):
+        #     cluster_pos = Vector3(center[0], center[1], center[2])
+        #     if frustum.sphere_in_frustum(cluster_pos.x, cluster_pos.y, cluster_pos.z, cluster_radii[cluster_id]):
+        #         draw_sphere_wires(cluster_pos, cluster_radii[cluster_id], 8, 8, GRAY)
+
+        #==== Draw billboards ====
+        for cluster_id, cluster_billboards in clustered_billboards.items():
+        
+            cluster_center = Vector3(cluster_centers[cluster_id][0], cluster_centers[cluster_id][1], cluster_centers[cluster_id][2])
+            distance_to_cluster = vector3_length(vector3_subtract(cluster_center, camera.position))
             
+            if not frustum.sphere_in_frustum(cluster_center.x, cluster_center.y, cluster_center.z, 10):  # Adjust radius as needed
+                    continue
+            
+            # Determine how many billboards to render based on distance
+            max_billboards = min(len(cluster_billboards), 50)  # Never render more than 50 per cluster
+            billboards_to_render = max(5, int(max_billboards * (1 - distance_to_cluster / draw_distance_threshold)))
+            
+            # Sort billboards by distance to camera and take the closest ones
+            sorted_billboards = sorted(cluster_billboards, 
+                                    key=lambda x: vector3_length(vector3_subtract(x[0], camera.position)))
+            billboards_to_render = sorted_billboards[:billboards_to_render]
+
+            for billboard_position, atlas_position, label in billboards_to_render:
+                distance_to_camera = vector3_length(vector3_subtract(billboard_position, camera.position))
+                if distance_to_camera > draw_distance_threshold:
+                    continue
+                
             drawn_images+=1
             
             # size is 1x1x1

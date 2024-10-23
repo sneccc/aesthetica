@@ -1,5 +1,5 @@
 from pyray import *
-from frustum import Frustum
+from tests.raylib.fustum_test.frustum_v2 import Frustum
 import random
 
 # Initialize the window
