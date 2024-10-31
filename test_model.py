@@ -24,6 +24,9 @@ def predict_score(root_folder, clip_models):
     
     #load csv
     df = pd.read_csv(csv_path)
+    #create mapping from image name to original path
+    path_mapping = dict(zip(df['image_name'], df['original_path']))
+    
     #load label_id and label_name as dict, unique values but ignore label_name "test"
     label_id_to_name = dict(zip(df[df['label_name'] != 'test']['label_id'].unique(), df[df['label_name'] != 'test']['label_name'].unique()))
     print(f"🐍label_id_to_name: {label_id_to_name}")
@@ -41,7 +44,7 @@ def predict_score(root_folder, clip_models):
     print(f"🐍 found {len(test_images)} test images")
     
     
-    batch_size = 256
+    batch_size = 64
     total_predictions = []
 
     # Process test images in batches
@@ -96,10 +99,18 @@ def predict_score(root_folder, clip_models):
         target_dir = prediction_folder / label_name
         target_dir.mkdir(exist_ok=True)
         
-        # Copy the file to the predicted label directory instead of moving
+        # Get just the filename from the path
         img_path = pathlib.Path(img_path)
-        import shutil
-        shutil.copy2(img_path, target_dir / img_path.name)
+        img_name = img_path.name
+        original_path = path_mapping.get(img_name)
+        
+        if original_path:
+            # Copy from original path to prediction directory
+            shutil.copy2(original_path, target_dir / img_name)
+        else:
+            # Fallback to processed image if original not found
+            print(f"Warning: Original path not found for {img_name}, using processed image")
+            shutil.copy2(img_path, target_dir / img_name)
 
 
 def prepare_clip_models(clip_models):

@@ -13,10 +13,13 @@ def main():
     current_dir = os.path.dirname(os.path.abspath(__file__))
     #font = load_font_ex(os.path.join(current_dir, "../../resources/fonts/Roboto-Regular.ttf").encode(), 24, 0, 0)
     #load embeddings and paths
-    data_dir = os.path.join(current_dir, "../../data/normalized_art_categories")
+    data_dir = os.path.join(current_dir, "../../data/normalized_test")
     embeddings, atlas_dir, atlas_positions, labels = load_embeddings_and_paths(data_dir)
 
     print("🐍 Applying UMAP")
+    # Reshape embeddings if they're 3D
+    if len(embeddings.shape) == 3:
+        embeddings = embeddings.reshape(embeddings.shape[0], -1)
     # Apply UMAP to reduce dimensionality to 3D
     reducer = umap.UMAP(n_components=3, n_neighbors=5, min_dist=0.3, metric='correlation')
     embeddings_3d = reducer.fit_transform(embeddings)
@@ -104,7 +107,7 @@ def main():
     
     
     #LOD
-    draw_distance_threshold = 10.0
+    draw_distance_threshold = 100.0
     # GL_TEXTURE_2D = 0x0DE1
     # GL_TEXTURE_LOD_BIAS = 0x8501
     # LOD_BIAS = -0.5 

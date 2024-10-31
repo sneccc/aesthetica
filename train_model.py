@@ -10,6 +10,9 @@ from sklearn.model_selection import train_test_split
 from pytorch_lightning.callbacks import EarlyStopping, ModelCheckpoint, LearningRateMonitor
 from pytorch_lightning.loggers import TensorBoardLogger
 import pandas as pd
+import json
+from dataclasses import dataclass, asdict
+from typing import List, Tuple
 
 
 torch.manual_seed(42)
@@ -72,9 +75,12 @@ class MultiLayerPerceptron(pl.LightningModule):
     def training_step(self, batch, batch_idx):
         x = batch[0]
         y = batch[1]
+        
+        # Add training augmentations here
+        #x = self.training_augmentations(x)
+        
         logits = self(x)
-
-        loss_func = torch.nn.CrossEntropyLoss()
+        loss_func = torch.nn.CrossEntropyLoss(label_smoothing=0.15)
         loss = loss_func(logits, y)
 
         preds = torch.argmax(logits, dim=1)
@@ -143,8 +149,8 @@ class MultiLayerPerceptron(pl.LightningModule):
                 stepping_batches = self.trainer.estimated_stepping_batches
                 print(f"🐍 Total number of steps {stepping_batches}")
                 max_lr = 5e-3
-                default_lr = 2e-3
-                optimizer = torch.optim.SGD(self.parameters(), lr=default_lr, momentum=0.9, weight_decay=0.1)
+                default_lr = 5e-4
+                optimizer = torch.optim.SGD(self.parameters(), lr=default_lr, momentum=0.9, weight_decay=0.001)
                 #scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=0.01, patience=100, verbose=True)
                 # scheduler = torch.optim.lr_scheduler.OneCycleLR(
                 #     optimizer,
@@ -157,12 +163,52 @@ class MultiLayerPerceptron(pl.LightningModule):
 
                 return optimizer
             
+    def training_augmentations(self, x):
+        # Add random noise
+        noise = torch.randn_like(x) * 0.1
+        x = x + noise
+        
+        # Random feature dropout (randomly zero out some features)
+        mask = torch.bernoulli(torch.ones_like(x) * 0.9)  # Keep 90% of features
+        x = x * mask
+        
+        return x
+
+@dataclass
+class ModelConfig:
+    input_size: int
+    num_classes: int
+    hidden_units: Tuple[int, ...]
+    clip_models: List[Tuple[str, str]]
+    class_labels: List[str]  # Map from class index to label name
+
 def start_training(root_folder, database_file, train_from, clip_models, val_percentage=0.25, epochs=5000, batch_size=1000):
     train_dataloader, val_dataloader, num_classes = setup_dataset(root_folder=root_folder, database_file=database_file,train_from=train_from)
     input_size = get_total_dim(clip_models)
-    print(f"input size: {input_size}\nNumber of classes: {num_classes}")  # 1152
+    print(f"input size: {input_size}\nNumber of classes: {num_classes}")
 
-    net = MultiLayerPerceptron(input_size=input_size, num_classes=num_classes)
+    # Get class labels mapping
+    df = pd.read_csv(pathlib.Path(root_folder) / 'image_classifier_data.csv')
+    class_labels = []
+    for i in range(num_classes):
+        label = df[df['label_id'] == i]['label_name'].iloc[0]
+        class_labels.append(label)
+
+    # Create config
+    config = ModelConfig(
+        input_size=input_size,
+        num_classes=num_classes,
+        hidden_units=(1024, 512, 256, 128),  # Your default architecture
+        clip_models=clip_models,
+        class_labels=class_labels
+    )
+
+    net = MultiLayerPerceptron(
+        input_size=config.input_size, 
+        num_classes=config.num_classes,
+        hidden_units=config.hidden_units
+    )
+    
     callbacks = [
         ModelCheckpoint(save_top_k=1, mode='max', monitor="val_acc"),
         LearningRateMonitor(logging_interval='epoch'),
@@ -189,36 +235,54 @@ def start_training(root_folder, database_file, train_from, clip_models, val_perc
 
     trainer.fit(net, train_dataloader, val_dataloader)
 
-    save_path = pathlib.Path(root_folder) / "model.pth"
-    print("-> saving model in to.. ", save_path)
+    # Save both model and config
+    root_path = pathlib.Path(root_folder)
+    save_path = root_path / "model.pth"
+    config_path = root_path / "model_config.json"
+    
+    print("-> saving model to:", save_path)
     torch.save(net.state_dict(), save_path)
     
+    print("-> saving config to:", config_path)
+    with open(config_path, 'w') as f:
+        json.dump(asdict(config), f, indent=2)
 
 
-def setup_dataset(root_folder, database_file, train_from):
+def setup_dataset(root_folder, database_file, train_from, val_percentage=0.25):
     out_path = pathlib.Path(root_folder)
-
     x_embeddings_path = out_path / "image_embeddings.npy"
     
-    # Load the CSV to get labels
+    # Load the CSV with augmentation information
     df = pd.read_csv(out_path / 'image_classifier_data.csv')
+    print(f"Loaded CSV with {len(df)} entries")
     
-    # Match embeddings with labels
+    # Load embeddings
     x_embeddings = np.load(x_embeddings_path)
+    print(f"Loaded embeddings with shape: {x_embeddings.shape}")
+    
+    # Get labels from DataFrame
     y_features = df['label_id'].values
+    
+    # Verify lengths match using embedding_index
+    assert len(x_embeddings) == len(df), \
+        f"Mismatch between embeddings ({len(x_embeddings)}) and DataFrame entries ({len(df)})"
     
     # Filter out test data (negative labels) before splitting into train/val
     valid_mask = y_features >= 0
     x_features = x_embeddings[valid_mask]
     y_features = y_features[valid_mask]
+    filtered_df = df[valid_mask]
     
     # Now split the valid data into train/val
+    # Use stratification based on original images (not augmentations)
+    # Get original image indices for stratification
+    original_indices = filtered_df['image_path'].values
     x_train, x_val, y_train, y_val = train_test_split(
         x_features, 
         y_features,
         test_size=0.2,
         random_state=42,
-        stratify=y_features  # This ensures balanced split across classes
+        stratify=original_indices  # Stratify by original image to keep augmentations together
     )
     
     # Convert to tensors
@@ -228,19 +292,21 @@ def setup_dataset(root_folder, database_file, train_from):
     val_tensor_y = torch.Tensor(y_val).long()
     
     # Debug prints
-    print("Label range:", torch.min(train_tensor_y).item(), "to", torch.max(train_tensor_y).item())
-    print("Data range:", torch.min(train_tensor_x).item(), "to", torch.max(train_tensor_x).item())
-    print("Data dtype:", train_tensor_x.dtype)
-    print("Labels dtype:", train_tensor_y.dtype)
+    print("\nDataset Statistics:")
+    print(f"Training samples: {len(train_tensor_x)}")
+    print(f"Validation samples: {len(val_tensor_x)}")
+    print(f"Label range: {torch.min(train_tensor_y).item()} to {torch.max(train_tensor_y).item()}")
+    print(f"Data range: {torch.min(train_tensor_x).item():.2f} to {torch.max(train_tensor_x).item():.2f}")
     
     # Calculate class distribution
-    cpu_labels = train_tensor_y.cpu().numpy()
-    class_counts = np.bincount(cpu_labels)
-    print("🐍 Class Frequency: ", class_counts)
+    class_counts = np.bincount(y_train)
+    print("\nClass Distribution:")
+    for class_idx, count in enumerate(class_counts):
+        print(f"Class {class_idx}: {count} samples")
     num_classes = len(class_counts)
-    print("🐍 Number of classes: ", num_classes)
     
-    batch_size = 6000
+    # Create dataloaders
+    batch_size = 64
     train_dataset = TensorDataset(train_tensor_x, train_tensor_y)
     val_dataset = TensorDataset(val_tensor_x, val_tensor_y)
     

@@ -4,3 +4,4 @@ tests/old
 tests/brython
 **/__pycache__**
 tb_logs/
+evaluate/

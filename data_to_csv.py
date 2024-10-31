@@ -20,6 +20,9 @@ project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 
 def process_image(old_path, new_path, label_name, is_test, force_overwrite=True):
     try:
+        # Store absolute path of original image
+        original_path = os.path.abspath(old_path)
+        
         # Always process the image, no early returns
         # Read with PIL first to handle CMYK conversion
         with Image.open(old_path) as pil_img:
@@ -55,47 +58,72 @@ def process_image(old_path, new_path, label_name, is_test, force_overwrite=True)
                 pnginfo=None
             )
         
-        return new_path, os.path.basename(new_path), label_name, is_test
+        return new_path, os.path.basename(new_path), label_name, is_test, original_path
     except Exception as e:
         print(f"Error processing {old_path}: {str(e)}")
         return None
 
-def normalize_data(root_directory, output_directory):
+def normalize_data(root_directory, output_directory, images_per_class=None):
     if not os.path.exists(output_directory):
         os.makedirs(output_directory)
 
-    # Collect all image paths first
     tasks = []
+    moved_to_test = {}  # Track statistics
     
     # Process label folders
     label_folders = [d for d in os.listdir(root_directory) 
                     if os.path.isdir(os.path.join(root_directory, d)) 
                     and d != "test_data"]
     
+    # Ensure test_data directory exists
+    new_test_path = os.path.join(output_directory, "test_data")
+    if not os.path.exists(new_test_path):
+        os.makedirs(new_test_path)
+
     for label_name in label_folders:
         label_path = os.path.join(root_directory, label_name)
         new_label_path = os.path.join(output_directory, label_name)
         if not os.path.exists(new_label_path):
             os.makedirs(new_label_path)
         
-        for idx, file in enumerate(os.listdir(label_path)):
-            if file.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp')):
-                old_path = os.path.join(label_path, file)
+        # Get all image files for this label
+        image_files = [f for f in os.listdir(label_path) 
+                      if f.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp'))]
+        
+        moved_to_test[label_name] = 0
+        
+        for idx, file in enumerate(image_files):
+            old_path = os.path.join(label_path, file)
+            
+            # Decide if this should go to test based on the limit
+            if images_per_class and idx >= images_per_class:
+                new_name = f"test_{label_name}_{idx:04d}.png"
+                new_path = os.path.join(new_test_path, new_name)
+                tasks.append((old_path, new_path, "test", True))
+                moved_to_test[label_name] += 1
+            else:
                 new_name = f"{label_name}_{idx:04d}.png"
                 new_path = os.path.join(new_label_path, new_name)
                 tasks.append((old_path, new_path, label_name, False))
 
-    # Process test_data folder
+    # Process images in root directory as test images
+    root_images = [f for f in os.listdir(root_directory) 
+                   if os.path.isfile(os.path.join(root_directory, f))
+                   and f.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp'))]
+    
+    for idx, file in enumerate(root_images):
+        old_path = os.path.join(root_directory, file)
+        new_name = f"test_root_{idx:04d}.png"
+        new_path = os.path.join(new_test_path, new_name)
+        tasks.append((old_path, new_path, "test", True))
+
+    # Process existing test_data folder
     test_data_path = os.path.join(root_directory, "test_data")
     if os.path.exists(test_data_path):
-        new_test_path = os.path.join(output_directory, "test_data")
-        if not os.path.exists(new_test_path):
-            os.makedirs(new_test_path)
-            
         for idx, file in enumerate(os.listdir(test_data_path)):
             if file.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp')):
                 old_path = os.path.join(test_data_path, file)
-                new_name = f"test_{idx:04d}.png"
+                new_name = f"test_orig_{idx:04d}.png"
                 new_path = os.path.join(new_test_path, new_name)
                 tasks.append((old_path, new_path, "test", True))
 
@@ -104,19 +132,26 @@ def normalize_data(root_directory, output_directory):
         delayed(process_image)(*task) for task in tqdm(tasks)
     )
     
+    # Print statistics
+    print("\nImages moved to test set:")
+    for label, count in moved_to_test.items():
+        if count > 0:
+            print(f"{label}: {count} images")
+    
     # Filter out None results from failed processing
     results = [r for r in results if r is not None]
     return zip(*results)
 
-def create_image_dataframe(root_directory, output_directory):
-    image_paths, image_names, label_names, is_test = normalize_data(root_directory, output_directory)
+def create_image_dataframe(root_directory, output_directory, images_per_class=None):
+    image_paths, image_names, label_names, is_test, original_paths = normalize_data(root_directory, output_directory, images_per_class)
     
-    # Create DataFrame
+    # Create DataFrame with original_path added
     df = pd.DataFrame({
         'image_path': image_paths,
         'image_name': image_names,
         'label_name': label_names,
-        'is_test': is_test
+        'is_test': is_test,
+        'original_path': original_paths
     })
     
     # Create label_id using simple incremental approach
@@ -134,6 +169,7 @@ def create_image_dataframe(root_directory, output_directory):
 def main():
     parser = argparse.ArgumentParser(description="Process image dataset and create a DataFrame.")
     parser.add_argument("-i", "--input_directory", required=True, help="Path to the input image directory")
+    parser.add_argument("--images-per-class", type=int, help="Maximum number of images per class (excess will be moved to test)")
     args = parser.parse_args()
     print(f"Input directory: {args.input_directory}")
     root_directory = os.path.abspath(args.input_directory)
@@ -143,10 +179,10 @@ def main():
     else:
         output_directory = os.path.join(os.path.dirname(root_directory), f"normalized_{os.path.basename(root_directory)}")
     
-    image_df = create_image_dataframe(root_directory, output_directory)
+    image_df = create_image_dataframe(root_directory, output_directory, args.images_per_class)
 
-    # Save the DataFrame to a CSV file
-    csv_path = os.path.join(root_directory, 'image_classifier_data.csv')
+    # Save the DataFrame to a CSV file in the normalized output directory
+    csv_path = os.path.join(output_directory, 'image_classifier_data.csv')
     image_df.to_csv(csv_path, index=False)
 
     # Print some information about the dataset
