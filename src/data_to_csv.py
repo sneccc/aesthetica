@@ -169,15 +169,25 @@ def create_image_dataframe(root_directory, output_directory, images_per_class=No
 def main():
     parser = argparse.ArgumentParser(description="Process image dataset and create a DataFrame.")
     parser.add_argument("-i", "--input_directory", required=True, help="Path to the input image directory")
+    parser.add_argument("-o", "--output_directory", help="Path to the output directory (optional)")
     parser.add_argument("--images-per-class", type=int, help="Maximum number of images per class (excess will be moved to test)")
     args = parser.parse_args()
     print(f"Input directory: {args.input_directory}")
     root_directory = os.path.abspath(args.input_directory)
-    #first verify if normalized in the current folder
-    if os.path.basename(root_directory).startswith("normalized_"):
+    
+    # Determine output directory
+    if args.output_directory:
+        output_directory = os.path.abspath(args.output_directory)
+    elif os.path.basename(root_directory).startswith("normalized_"):
         output_directory = root_directory
     else:
-        output_directory = os.path.join(os.path.dirname(root_directory), f"normalized_{os.path.basename(root_directory)}")
+        # Find the project root and create normalized directory in datasets/
+        project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+        datasets_dir = os.path.join(project_root, 'datasets', 'normalized')
+        dataset_name = os.path.basename(root_directory)
+        output_directory = os.path.join(datasets_dir, dataset_name)
+    
+    print(f"Output directory: {output_directory}")
     
     image_df = create_image_dataframe(root_directory, output_directory, args.images_per_class)
 

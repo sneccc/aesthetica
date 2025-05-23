@@ -1,0 +1,7 @@
+rich>=13.0.0
+torch>=1.9.0
+pandas>=1.3.0
+scikit-learn>=1.0.0
+open-clip-torch
+timm
+numpy>=1.21.0 
