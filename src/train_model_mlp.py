@@ -8,12 +8,34 @@ from torch.utils.data import TensorDataset, DataLoader
 from torch.utils.data.dataloader import default_collate
 from sklearn.model_selection import train_test_split
 from pytorch_lightning.callbacks import EarlyStopping, ModelCheckpoint, LearningRateMonitor
-from pytorch_lightning.loggers import TensorBoardLogger
+from pytorch_lightning.loggers import TensorBoardLogger, WandbLogger
 import pandas as pd
 import json
 from dataclasses import dataclass, asdict
 from typing import List, Tuple
 from pytorch_lamb import Lamb
+from PIL import Image
+import wandb
+from datetime import datetime
+import time
+import threading
+
+# System monitoring imports
+try:
+    import psutil
+    import GPUtil
+    SYSTEM_MONITORING_AVAILABLE = True
+except ImportError:
+    SYSTEM_MONITORING_AVAILABLE = False
+
+# Import wandb utilities
+try:
+    from .wandb_utils import setup_wandb_key, get_wandb_enabled
+except ImportError:
+    # Handle case when running as script
+    import sys
+    sys.path.append('.')
+    from src.wandb_utils import setup_wandb_key, get_wandb_enabled
 
 torch.manual_seed(42)
 np.random.seed(42)
@@ -50,10 +72,216 @@ class MultiLayerPerceptron(pl.LightningModule):
 
         all_layers.append(nn.Linear(hidden_units[-1], num_classes))
         self.model = nn.Sequential(*all_layers)
+        
+        # Store validation data for visualization
+        self.val_sample_data = None
+        self.val_sample_info = None
+        self.class_labels = None
+        self.root_folder = None
+        self.validation_viz_count = 0
+        self.validation_viz_epochs = []
 
     def forward(self, x):
         x = self.model(x)
         return x
+    
+    def setup_validation_visualization_simple(self, val_dataloader, val_df_info, class_labels, root_folder, num_samples=10):
+        """Setup validation visualization with direct DataFrame mapping."""
+        self.class_labels = class_labels
+        self.root_folder = pathlib.Path(root_folder)
+        
+        # Get a sample of validation data
+        val_dataset = val_dataloader.dataset
+        dataset_size = len(val_dataset)
+        num_samples = min(num_samples, dataset_size, len(val_df_info))
+        
+        # Sample random indices
+        indices = torch.randperm(dataset_size)[:num_samples]
+        
+        sample_embeddings = []
+        sample_labels = []
+        sample_info = []
+        
+        for idx in indices:
+            idx = int(idx.item())
+            if idx < len(val_dataset) and idx < len(val_df_info):
+                try:
+                    embedding, label = val_dataset[idx]
+                    row = val_df_info.iloc[idx]
+                    
+                    sample_embeddings.append(embedding)
+                    sample_labels.append(label)
+                    sample_info.append({
+                        'image_path': row['image_path'],
+                        'image_name': row['image_name'],
+                        'label_name': row['label_name'],
+                        'label_id': row['label_id']
+                    })
+                except Exception as e:
+                    print(f"Warning: Could not process validation sample {idx}: {e}")
+                    continue
+        
+        if sample_embeddings:
+            self.val_sample_data = torch.stack(sample_embeddings)
+            self.val_sample_labels = torch.stack(sample_labels)
+            self.val_sample_info = sample_info
+        else:
+            print("Warning: No validation samples could be prepared for visualization")
+
+    def setup_validation_visualization(self, val_dataloader, df, class_labels, root_folder, num_samples=10):
+        """Setup validation visualization by sampling some validation data."""
+        self.class_labels = class_labels
+        self.root_folder = pathlib.Path(root_folder)
+        
+        # Get a sample of validation data
+        val_dataset = val_dataloader.dataset
+        dataset_size = len(val_dataset)
+        indices = torch.randperm(dataset_size)[:min(num_samples, dataset_size)]
+        
+        sample_embeddings = []
+        sample_labels = []
+        sample_info = []
+        
+        # Get filtered DataFrame (same filtering as in setup_dataset)
+        val_mask = df['label_id'] >= 0
+        filtered_df = df[val_mask].reset_index(drop=True)
+        
+        # Since we're using the same random seed (42), the split should be identical
+        # We can get validation indices by recreating the split
+        from sklearn.model_selection import train_test_split
+        y_features = filtered_df['label_id'].values
+        
+        try:
+            train_indices, val_indices = train_test_split(
+                range(len(filtered_df)), 
+                test_size=0.25,
+                random_state=42,
+                stratify=y_features
+            )
+        except ValueError:
+            train_indices, val_indices = train_test_split(
+                range(len(filtered_df)), 
+                test_size=0.25,
+                random_state=42,
+                stratify=None
+            )
+        
+        # Convert to DataFrame with validation subset
+        val_df_subset = filtered_df.iloc[val_indices].reset_index(drop=True)
+        
+        for idx_pos, dataset_idx in enumerate(indices):
+            dataset_idx = int(dataset_idx.item())  # Convert tensor to int
+            if dataset_idx < len(val_dataset) and dataset_idx < len(val_df_subset):
+                try:
+                    row = val_df_subset.iloc[dataset_idx]
+                    
+                    embedding, label = val_dataset[dataset_idx]
+                    sample_embeddings.append(embedding)
+                    sample_labels.append(label)
+                    sample_info.append({
+                        'image_path': row['image_path'],
+                        'image_name': row['image_name'],
+                        'label_name': row['label_name'],
+                        'label_id': row['label_id']
+                    })
+                except Exception as e:
+                    print(f"Warning: Could not process validation sample {dataset_idx}: {e}")
+                    continue
+        
+        if sample_embeddings:
+            self.val_sample_data = torch.stack(sample_embeddings)
+            self.val_sample_labels = torch.stack(sample_labels)
+            self.val_sample_info = sample_info
+        else:
+            print("Warning: No validation samples could be prepared for visualization")
+
+    def log_validation_predictions(self):
+        """Log validation predictions to wandb with images."""
+        
+        if self.val_sample_data is None:
+            return False
+        
+        # Find wandb logger from the list of loggers
+        wandb_logger = None
+        if hasattr(self.trainer, 'loggers'):
+            for logger in self.trainer.loggers:
+                if hasattr(logger, 'experiment') and hasattr(logger.experiment, 'log'):
+                    # Check if it's a wandb logger
+                    if hasattr(logger.experiment, 'project'):
+                        wandb_logger = logger
+                        break
+        
+        if wandb_logger is None:
+            return False
+            
+        try:
+            # Get predictions
+            self.eval()
+            with torch.no_grad():
+                logits = self(self.val_sample_data.to(self.device))
+                predictions = torch.argmax(logits, dim=1)
+                probabilities = torch.softmax(logits, dim=1)
+            
+            # Create wandb table data
+            table_data = []
+            successful_rows = 0
+            
+            for i, info in enumerate(self.val_sample_info):
+                
+                # Load image
+                try:
+                    image_path = pathlib.Path(info['image_path'])
+                    if not image_path.is_absolute():
+                        image_path = self.root_folder / image_path
+                    
+                    if image_path.exists():
+                        pil_img = Image.open(image_path).convert('RGB')
+                        # Resize for display
+                        pil_img.thumbnail((224, 224), Image.Resampling.LANCZOS)
+                        wandb_image = wandb.Image(pil_img)
+                    else:
+                        print(f"Warning: Image not found: {image_path}")
+                        wandb_image = None
+                except Exception as e:
+                    print(f"Warning: Could not load image {info['image_path']}: {e}")
+                    wandb_image = None
+                
+                pred_id = predictions[i].item()
+                true_id = self.val_sample_labels[i].item()
+                pred_label = self.class_labels[pred_id] if pred_id < len(self.class_labels) else f"Unknown_{pred_id}"
+                true_label = self.class_labels[true_id] if true_id < len(self.class_labels) else f"Unknown_{true_id}"
+                confidence = probabilities[i][pred_id].item()
+                
+                table_data.append([
+                    wandb_image,
+                    info['image_name'],
+                    true_label,
+                    pred_label,
+                    f"{confidence:.3f}",
+                    "CORRECT" if pred_id == true_id else "WRONG"
+                ])
+                successful_rows += 1
+            
+            if successful_rows == 0:
+                return False
+            
+            # Create and log table
+            table = wandb.Table(
+                columns=["Image", "Filename", "True Label", "Predicted Label", "Confidence", "Correct"],
+                data=table_data
+            )
+            
+            wandb_logger.experiment.log({
+                f"validation_predictions_epoch_{self.current_epoch}": table
+            })
+            
+            return True
+            
+        except Exception as e:
+            print(f"Warning: Failed to log validation predictions: {e}")
+            import traceback
+            traceback.print_exc()
+            return False
 
     def validation_step(self, batch, batch_idx):
         x = batch[0]
@@ -108,10 +336,40 @@ class MultiLayerPerceptron(pl.LightningModule):
         self.train_recall.reset()
 
     def on_validation_epoch_end(self):
+        # Write validation info to a debug file
+        debug_file = self.root_folder / "validation_debug.txt" if self.root_folder else pathlib.Path("validation_debug.txt")
+        with open(debug_file, "a") as f:
+            f.write(f"VALIDATION_RUN: epoch={self.current_epoch}, time={datetime.now()}\n")
+        
         self.log("val_acc", self.val_acc.compute())
         self.log('val_f1_score', self.val_f1_score.compute(), prog_bar=False)
         self.log('val_precision', self.val_precision.compute(), prog_bar=False)
         self.log('val_recall', self.val_recall.compute(), prog_bar=False)
+
+        # Log validation predictions more frequently - every 50 epochs OR every 5 validation runs
+        # Since validation runs every 5 epochs, this means visualization at epochs: 0, 25, 50, 75, 100, etc.
+        validation_run_count = (self.current_epoch // 5) + 1  # Approximate validation run number
+        should_visualize = (
+            self.current_epoch == 0 or  # Always visualize at epoch 0
+            self.current_epoch % 25 == 0 or  # Every 25 epochs (more frequent than before)
+            validation_run_count % 5 == 0  # Every 5 validation runs
+        )
+        
+        if should_visualize:
+            with open(debug_file, "a") as f:
+                f.write(f"VISUALIZATION_ATTEMPT: epoch={self.current_epoch}, validation_run={validation_run_count}, time={datetime.now()}\n")
+            
+            success = self.log_validation_predictions()
+            if success:
+                self.validation_viz_count += 1
+                self.validation_viz_epochs.append(self.current_epoch)
+                with open(debug_file, "a") as f:
+                    f.write(f"VISUALIZATION_SUCCESS: epoch={self.current_epoch}, count={self.validation_viz_count}\n")
+            else:
+                with open(debug_file, "a") as f:
+                    f.write(f"VISUALIZATION_FAILED: epoch={self.current_epoch}\n")
+        else:
+            print(f">> Skipping validation visualization at epoch {self.current_epoch} (next at epoch {((self.current_epoch // 25) + 1) * 25})")
 
         # Reset metrics at the end of each epoch
         self.val_acc.reset()
@@ -240,6 +498,34 @@ class MultiLayerPerceptron(pl.LightningModule):
         
         return x
 
+    def test_validation_visualization_setup(self, trainer=None):
+        """Test if validation visualization is properly set up."""
+        print(">> Testing validation visualization setup:")
+        print(f">>   val_sample_data: {'OK' if self.val_sample_data is not None else 'MISSING'}")
+        print(f">>   val_sample_info: {'OK' if self.val_sample_info is not None else 'MISSING'}")
+        print(f">>   class_labels: {'OK' if self.class_labels is not None else 'MISSING'}")
+        print(f">>   root_folder: {'OK' if self.root_folder is not None else 'MISSING'}")
+        
+        if self.val_sample_data is not None:
+            print(f">>   Sample data shape: {self.val_sample_data.shape}")
+            print(f">>   Number of samples: {len(self.val_sample_info) if self.val_sample_info else 0}")
+        
+        # Check for trainer and loggers
+        current_trainer = trainer if trainer is not None else getattr(self, 'trainer', None)
+        if current_trainer and hasattr(current_trainer, 'loggers'):
+            wandb_logger_found = False
+            for logger in current_trainer.loggers:
+                if hasattr(logger, 'experiment') and hasattr(logger.experiment, 'project'):
+                    wandb_logger_found = True
+                    break
+            print(f">>   wandb logger: {'OK' if wandb_logger_found else 'MISSING'}")
+        else:
+            print(f">>   wandb logger: PENDING (trainer not attached yet)")
+        
+        return (self.val_sample_data is not None and 
+                self.val_sample_info is not None and 
+                self.class_labels is not None)
+
 @dataclass
 class ModelConfig:
     input_size: int
@@ -248,8 +534,14 @@ class ModelConfig:
     clip_models: List[Tuple[str, str]]
     class_labels: List[str]  # Map from class index to label name
 
-def start_training(root_folder, database_file, train_from, clip_models, val_percentage=0.25, epochs=5000, batch_size=1000):
-    train_dataloader, val_dataloader, num_classes = setup_dataset(root_folder=root_folder, database_file=database_file,train_from=train_from)
+def start_training(root_folder, database_file, train_from, clip_models, val_percentage=0.25, epochs=5000, batch_size=1000, enable_wandb=True, enable_dashboard=True):
+    # Setup wandb if enabled
+    wandb_enabled = False
+    if enable_wandb:
+        wandb_key = setup_wandb_key(root_folder, ask_user=True)
+        wandb_enabled = wandb_key is not None
+
+    train_dataloader, val_dataloader, num_classes, val_df_info = setup_dataset(root_folder=root_folder, database_file=database_file,train_from=train_from)
     input_size = get_total_dim(clip_models)
     print(f"input size: {input_size}\nNumber of classes: {num_classes}")
 
@@ -281,25 +573,87 @@ def start_training(root_folder, database_file, train_from, clip_models, val_perc
         EarlyStopping(
             monitor='val_recall',
             min_delta=0.0000001,
-            patience=25,
+            patience=50,  # Increased patience since validation is more frequent
             verbose=True,
             mode='max'
         )
-    ]  # save top 1 model
-    logger = TensorBoardLogger('tb_logs', name="my_logger", log_graph=True)
-    # lr_monitor = LearningRateMonitor(logging_interval='epoch')
+    ]
+    
+    # Add simple dashboard if enabled
+    if enable_dashboard:
+        callbacks.append(SimpleDashboard(total_epochs=epochs))
+    else:
+        print(">> Training without dashboard")
+    
+    # Setup loggers
+    loggers = []
+    
+    # Always add TensorBoard logger
+    tb_logger = TensorBoardLogger('tb_logs', name="my_logger", log_graph=True)
+    loggers.append(tb_logger)
+    
+    # Add wandb logger if enabled
+    wandb_logger = None
+    if wandb_enabled:
+        # Create wandb config with training hyperparameters
+        wandb_config = {
+            "architecture": "MLP",
+            "input_size": config.input_size,
+            "num_classes": config.num_classes,
+            "hidden_units": config.hidden_units,
+            "epochs": epochs,
+            "batch_size": batch_size,
+            "val_percentage": val_percentage,
+            "clip_models": [f"{model[0]}:{model[1]}" for model in clip_models],
+            "class_labels": config.class_labels,
+            "optimizer": "lion",  # Based on current default in configure_optimizers
+            "monitor_metric": "val_recall",
+            "early_stopping_patience": 50
+        }
+        
+        wandb_logger = WandbLogger(
+            project="aesthetica-training",
+            name=f"mlp-{len(config.class_labels)}classes-{input_size}dim",
+            config=wandb_config,
+            log_model="all",  # Log model checkpoints
+            save_dir="wandb_logs"
+        )
+        loggers.append(wandb_logger)
+        
+        # Setup validation visualization for wandb with the validation DataFrame info
+        net.setup_validation_visualization_simple(
+            val_dataloader=val_dataloader,
+            val_df_info=val_df_info,
+            class_labels=config.class_labels,
+            root_folder=root_folder,
+            num_samples=10
+        )
+    else:
+        print(">> Wandb logging disabled")
 
     torch.set_float32_matmul_precision('high')
     trainer = pl.Trainer(
-        logger=logger,  # This is your TensorBoardLogger
+        logger=loggers,  # Use list of loggers
         max_epochs=epochs,
         devices="auto",
         accelerator="cuda",
         callbacks=callbacks,
-        check_val_every_n_epoch=10  # Check validation every 10 epochs
+        check_val_every_n_epoch=5  # Check validation every 5 epochs for more frequent visualization
     )
 
+    # Final test of validation visualization setup
+    if wandb_enabled:
+        if not net.test_validation_visualization_setup(trainer):
+            print("WARNING: Validation visualization setup failed!")
+
     trainer.fit(net, train_dataloader, val_dataloader)
+
+    # Write final training info to debug file
+    debug_file = pathlib.Path(root_folder) / "validation_debug.txt"
+    with open(debug_file, "a") as f:
+        f.write(f"TRAINING_COMPLETED: final_epoch={trainer.current_epoch}, max_epochs={epochs}, viz_count={net.validation_viz_count}\n")
+    
+    print(f">> Training completed at epoch {trainer.current_epoch} (max was {epochs})")
 
     # Save both model and config
     root_path = pathlib.Path(root_folder)
@@ -312,6 +666,33 @@ def start_training(root_folder, database_file, train_from, clip_models, val_perc
     print("-> saving config to:", config_path)
     with open(config_path, 'w') as f:
         json.dump(asdict(config), f, indent=2)
+    
+    # Log final model artifact to wandb if enabled
+    if wandb_enabled and wandb_logger:
+        try:
+            # Log the final model as an artifact
+            artifact = wandb.Artifact(
+                name="final_model",
+                type="model",
+                description=f"Final trained MLP model with {config.num_classes} classes"
+            )
+            artifact.add_file(str(save_path))
+            artifact.add_file(str(config_path))
+            wandb_logger.experiment.log_artifact(artifact)
+            print(">> Saved model artifacts to wandb")
+        except Exception as e:
+            print(f"WARNING: Failed to log artifacts to wandb: {e}")
+    
+    # Return trainer, net, and validation visualization stats
+    viz_stats = {
+        'count': net.validation_viz_count,
+        'epochs': net.validation_viz_epochs
+    }
+    
+    # Print validation visualization stats for CLI parsing
+    print(f"VALIDATION_VIZ_STATS: count={net.validation_viz_count}, epochs={net.validation_viz_epochs}")
+    
+    return trainer, net, viz_stats
 
 
 def setup_dataset(root_folder, database_file, train_from, val_percentage=0.25):
@@ -343,9 +724,10 @@ def setup_dataset(root_folder, database_file, train_from, val_percentage=0.25):
     # Use stratification based on labels, but handle classes with only 1 sample
     try:
         # Try stratification by class labels first
-        x_train, x_val, y_train, y_val = train_test_split(
+        x_train, x_val, y_train, y_val, train_indices, val_indices = train_test_split(
             x_features, 
             y_features,
+            range(len(filtered_df)),
             test_size=0.25,
             random_state=42,
             stratify=y_features  # Stratify by actual class labels
@@ -354,9 +736,10 @@ def setup_dataset(root_folder, database_file, train_from, val_percentage=0.25):
         if "least populated class" in str(e):
             # Some classes have only 1 sample, use random split without stratification
             print("Warning: Some classes have very few samples. Using random split without stratification.")
-            x_train, x_val, y_train, y_val = train_test_split(
+            x_train, x_val, y_train, y_val, train_indices, val_indices = train_test_split(
                 x_features, 
                 y_features,
+                range(len(filtered_df)),
                 test_size=0.25,
                 random_state=42,
                 stratify=None  # No stratification
@@ -369,6 +752,9 @@ def setup_dataset(root_folder, database_file, train_from, val_percentage=0.25):
     train_tensor_y = torch.Tensor(y_train).long()
     val_tensor_x = torch.Tensor(x_val)
     val_tensor_y = torch.Tensor(y_val).long()
+    
+    # Create validation DataFrame info for visualization
+    val_df_info = filtered_df.iloc[val_indices].reset_index(drop=True)
     
     # Debug prints
     print("\nDataset Statistics:")
@@ -393,7 +779,7 @@ def setup_dataset(root_folder, database_file, train_from, val_percentage=0.25):
     train_dataloader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
     val_dataloader = DataLoader(val_dataset, batch_size=batch_size)
     
-    return train_dataloader, val_dataloader, num_classes
+    return train_dataloader, val_dataloader, num_classes, val_df_info
 
 def custom_collate_fn(batch):
     x_ = default_collate(batch)
@@ -418,6 +804,134 @@ def get_total_dim(clip_models):
     print("total_dim: ", total_dim)
     return total_dim
 
+def print_training_dashboard(epoch, total_epochs, metrics, start_time, epoch_start_time=None):
+    """Print a simple training dashboard every epoch"""
+    
+    # Safety check - don't run if start_time is None (during sanity check)
+    if start_time is None:
+        return
+    
+    # Calculate timing
+    elapsed = time.time() - start_time
+    elapsed_str = f"{elapsed//3600:.0f}h {(elapsed%3600)//60:.0f}m {elapsed%60:.0f}s"
+    
+    if epoch > 0:
+        avg_epoch_time = elapsed / epoch
+        remaining_epochs = total_epochs - epoch
+        eta = avg_epoch_time * remaining_epochs
+        eta_str = f"{eta//3600:.0f}h {(eta%3600)//60:.0f}m {eta%60:.0f}s"
+    else:
+        eta_str = "Calculating..."
+    
+    epoch_time = ""
+    if epoch_start_time:
+        epoch_duration = time.time() - epoch_start_time
+        epoch_time = f" (Last epoch: {epoch_duration:.1f}s)"
+    
+    progress_percent = (epoch / total_epochs) * 100
+    progress_bar = "#" * int(progress_percent / 5) + "-" * (20 - int(progress_percent / 5))
+    
+    # Get system stats if available
+    gpu_info = "N/A"
+    cpu_info = "N/A"
+    try:
+        if SYSTEM_MONITORING_AVAILABLE:
+            import psutil
+            cpu_percent = psutil.cpu_percent(interval=None)
+            cpu_info = f"{cpu_percent:.1f}%"
+            
+            try:
+                import GPUtil
+                gpus = GPUtil.getGPUs()
+                if gpus:
+                    gpu = gpus[0]
+                    gpu_info = f"{gpu.load*100:.1f}% / {gpu.memoryUtil*100:.1f}%"
+            except:
+                pass
+    except:
+        pass
+    
+    # Format metrics
+    train_loss = metrics.get('train_loss', 0.0)
+    val_loss = metrics.get('val_loss', 0.0)
+    train_acc = metrics.get('train_acc', 0.0)
+    val_acc = metrics.get('val_acc', 0.0)
+    train_f1 = metrics.get('train_f1_score', 0.0)
+    val_f1 = metrics.get('val_f1_score', 0.0)
+    lr = metrics.get('lr', 0.0)
+    
+    # Wandb status
+    wandb_status = "OFFLINE"
+    if hasattr(wandb, 'run') and wandb.run is not None:
+        wandb_status = "ONLINE"
+    
+    print("\n" + "="*80)
+    print("                    AESTHETICA TRAINING DASHBOARD")
+    print("="*80)
+    print(f"Epoch: {epoch:4d}/{total_epochs}  [{progress_bar}] {progress_percent:5.1f}%{epoch_time}")
+    print(f"Time:  Elapsed: {elapsed_str:>12} | ETA: {eta_str:>12}")
+    print("-"*80)
+    print("METRICS               TRAIN        VALIDATION     STATUS")
+    print("-"*80)
+    print(f"Loss                  {train_loss:8.4f}     {val_loss:8.4f}       {'DOWN' if val_loss > 0 and train_loss > val_loss else 'UP' if val_loss > 0 else 'WAIT'}")
+    print(f"Accuracy              {train_acc:8.1%}     {val_acc:8.1%}       {'GOOD' if val_acc > 0.8 else 'OK' if val_acc > 0.5 else 'TRAIN'}")
+    print(f"F1 Score              {train_f1:8.1%}     {val_f1:8.1%}       {'GREAT' if val_f1 > 0.8 else 'GOOD' if val_f1 > 0.5 else 'TRAIN'}")
+    print(f"Learning Rate         {lr:8.2e}     {'—':>8}       ACTIVE")
+    print("-"*80)
+    print(f"System: GPU {gpu_info:>12} | CPU {cpu_info:>6} | Wandb: {wandb_status}")
+    print("="*80)
+
+class SimpleDashboard(pl.Callback):
+    """Simple dashboard that prints training status every epoch"""
+    
+    def __init__(self, total_epochs):
+        super().__init__()
+        self.total_epochs = total_epochs
+        self.start_time = None
+        self.epoch_start_time = None
+        self.current_metrics = {}
+        
+    def on_train_start(self, trainer, pl_module):
+        self.start_time = time.time()
+        print("\n>>> Training started with simple dashboard")
+        
+    def on_train_epoch_start(self, trainer, pl_module):
+        self.epoch_start_time = time.time()
+        
+    def on_validation_epoch_end(self, trainer, pl_module):
+        # Skip dashboard during sanity check
+        if trainer.sanity_checking:
+            return
+            
+        # Update metrics from trainer logs
+        if hasattr(trainer, 'logged_metrics'):
+            logs = trainer.logged_metrics
+            self.current_metrics.update(logs)
+            
+        # Get learning rate
+        if trainer.optimizers:
+            optimizer = trainer.optimizers[0]
+            self.current_metrics['lr'] = optimizer.param_groups[0]['lr']
+        
+        # Print dashboard every validation epoch
+        print_training_dashboard(
+            epoch=trainer.current_epoch,
+            total_epochs=self.total_epochs,
+            metrics=self.current_metrics,
+            start_time=self.start_time,
+            epoch_start_time=self.epoch_start_time
+        )
+        
+    def on_train_end(self, trainer, pl_module):
+        print("\n>>> Training completed!")
+        print_training_dashboard(
+            epoch=trainer.current_epoch,
+            total_epochs=self.total_epochs,
+            metrics=self.current_metrics,
+            start_time=self.start_time,
+            epoch_start_time=self.epoch_start_time
+        )
+
 # --- Add command-line execution support ---
 if __name__ == "__main__":
     import argparse
@@ -428,6 +942,8 @@ if __name__ == "__main__":
     parser.add_argument("--epochs", type=int, default=100, help="Number of training epochs")
     parser.add_argument("--batch_size", type=int, default=32, help="Training batch size")
     parser.add_argument("--val_percentage", type=float, default=0.25, help="Validation split percentage")
+    parser.add_argument("--no-wandb", action="store_true", help="Disable wandb logging")
+    parser.add_argument("--no-dashboard", action="store_true", help="Disable rich dashboard")
 
     args = parser.parse_args()
 
@@ -444,6 +960,8 @@ if __name__ == "__main__":
     print(f"  - Batch size: {args.batch_size}")
     print(f"  - Validation percentage: {args.val_percentage}")
     print(f"  - CLIP model: {clip_models[0]}")
+    print(f"  - Wandb enabled: {not args.no_wandb}")
+    print(f"  - Dashboard enabled: {not args.no_dashboard}")
     
     start_training(
         root_folder=root_folder,
@@ -452,6 +970,8 @@ if __name__ == "__main__":
         clip_models=clip_models,
         val_percentage=args.val_percentage,
         epochs=args.epochs,
-        batch_size=args.batch_size
+        batch_size=args.batch_size,
+        enable_wandb=not args.no_wandb,
+        enable_dashboard=not args.no_dashboard
     )
     print("Training finished successfully!")

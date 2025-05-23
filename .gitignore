@@ -4,3 +4,10 @@ tests/old
 **/__pycache__**
 tb_logs/
 evaluate/
+
+# Security - API keys
+keys.txt
+
+# Wandb logging directories
+wandb/
+wandb_logs/

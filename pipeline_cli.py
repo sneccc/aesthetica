@@ -31,6 +31,20 @@ from rich.markdown import Markdown
 # Initialize Rich console
 console = Console()
 
+# Import wandb utilities
+sys.path.append(str(Path(__file__).parent / "src"))
+try:
+    from src.wandb_utils import setup_wandb_key, get_wandb_enabled, check_keys_file
+except ImportError:
+    # Fallback import
+    try:
+        from wandb_utils import setup_wandb_key, get_wandb_enabled, check_keys_file
+    except ImportError:
+        console.print("⚠️  wandb_utils not found. Wandb integration will be disabled.", style="yellow")
+        def setup_wandb_key(*args, **kwargs): return None
+        def get_wandb_enabled(): return False
+        def check_keys_file(*args, **kwargs): return None
+
 class AestheticaPipeline:
     """Main pipeline orchestrator for the Aesthetica ML workflow."""
     
@@ -53,6 +67,56 @@ class AestheticaPipeline:
             "model_training": {"completed": False, "time": None, "output_path": None},
             "model_testing": {"completed": False, "time": None, "results": None}
         }
+        
+        # Wandb configuration
+        self.wandb_enabled = False
+        self.wandb_configured = False
+    
+    def setup_wandb(self, ask_user: bool = True) -> bool:
+        """Setup wandb integration for the pipeline."""
+        if self.wandb_configured:
+            return self.wandb_enabled
+            
+        console.print("\n🔧 [bold blue]Wandb Integration Setup[/bold blue]")
+        
+        # Check if key already exists
+        existing_key = check_keys_file(str(self.project_root))
+        if existing_key:
+            self.wandb_enabled = True
+            self.wandb_configured = True
+            console.print("✅ [green]Wandb key found and configured[/green]")
+            return True
+        
+        if not ask_user:
+            self.wandb_configured = True
+            return False
+            
+        # Setup wandb key interactively
+        wandb_key = setup_wandb_key(str(self.project_root), ask_user=True)
+        
+        self.wandb_enabled = wandb_key is not None
+        self.wandb_configured = True
+        
+        if self.wandb_enabled:
+            console.print("✅ [green]Wandb integration enabled[/green]")
+        else:
+            console.print("⏭️  [yellow]Wandb integration disabled[/yellow]")
+            
+        return self.wandb_enabled
+    
+    def display_wandb_status(self) -> None:
+        """Display current wandb configuration status."""
+        if not self.wandb_configured:
+            status = "🔧 Not Configured"
+            style = "yellow"
+        elif self.wandb_enabled:
+            status = "✅ Enabled"
+            style = "green"
+        else:
+            status = "⏭️  Disabled"
+            style = "yellow"
+            
+        console.print(f"Wandb Logging: [{style}]{status}[/{style}]")
     
     def display_banner(self):
         """Display the application banner."""
@@ -154,6 +218,7 @@ class AestheticaPipeline:
     def run_command_with_progress(self, command: List[str], description: str, cwd: str = None) -> Tuple[bool, str]:
         """Run a command with a progress spinner and capture output."""
         output_lines = []
+        last_update_line = ""
         
         with Progress(
             SpinnerColumn(),
@@ -177,10 +242,32 @@ class AestheticaPipeline:
                 
                 # Read output line by line
                 for line in iter(process.stdout.readline, ''):
-                    output_lines.append(line.strip())
-                    # Update description with latest output (keep it short)
-                    if line.strip():
-                        progress.update(task, description=f"{description} - {line.strip()[:50]}...")
+                    line_stripped = line.strip()
+                    output_lines.append(line_stripped)
+                    
+                    # Only update progress for meaningful lines and avoid repetition
+                    if line_stripped and line_stripped != last_update_line:
+                        # Preserve important validation debug messages
+                        important_validation_patterns = [
+                            ">> validation epoch end:",
+                            ">> triggering validation", 
+                            ">> successfully completed validation",
+                            ">> failed validation",
+                            "validation_viz_stats:",
+                            ">> setup validation visualization"
+                        ]
+                        
+                        is_important_validation = any(pattern in line_stripped.lower() for pattern in important_validation_patterns)
+                        
+                        # Filter out common repetitive patterns but preserve important validation messages
+                        if is_important_validation or not any(pattern in line_stripped.lower() for pattern in [
+                            "epoch", "batch", "loss:", "accuracy:", "learning rate", 
+                            "val_loss", "val_acc", "step", "/", "%"
+                        ]):
+                            # Only show important progress messages, truncated
+                            update_text = line_stripped[:60] + "..." if len(line_stripped) > 60 else line_stripped
+                            progress.update(task, description=f"{description} - {update_text}")
+                            last_update_line = line_stripped
                 
                 process.wait()
                 success = process.returncode == 0
@@ -308,9 +395,15 @@ class AestheticaPipeline:
             console.print(Panel(output, title="Error Output", style="red"))
             return False
     
-    def train_model(self, normalized_path: str, epochs: int = 100, batch_size: int = 32) -> bool:
+    def train_model(self, normalized_path: str, epochs: int = 100, batch_size: int = 32, enable_wandb: bool = None) -> bool:
         """Train the MLP model."""
         console.print(f"\n🔄 [bold blue]Step 3: Training model[/bold blue]")
+        
+        # Setup wandb if not configured yet
+        if enable_wandb is None:
+            enable_wandb = self.setup_wandb(ask_user=True)
+        elif enable_wandb and not self.wandb_configured:
+            enable_wandb = self.setup_wandb(ask_user=False)
         
         # Display training parameters and paths with rich formatting
         training_table = Table(title="🚀 Model Training Configuration", box=box.ROUNDED)
@@ -320,6 +413,7 @@ class AestheticaPipeline:
         training_table.add_row("Input Labels", str(Path(normalized_path) / "labels.npy"))
         training_table.add_row("Training Epochs", f"[yellow]{epochs}[/yellow]")
         training_table.add_row("Batch Size", f"[yellow]{batch_size}[/yellow]")
+        training_table.add_row("Wandb Logging", f"[{'green' if enable_wandb else 'yellow'}]{'Enabled' if enable_wandb else 'Disabled'}[/{'green' if enable_wandb else 'yellow'}]")
         training_table.add_row("Model Output", str(Path(normalized_path) / "model.pth"))
         training_table.add_row("Config Output", str(Path(normalized_path) / "model_config.json"))
         console.print(training_table)
@@ -332,9 +426,13 @@ class AestheticaPipeline:
             "--batch_size", str(batch_size)
         ]
         
+        # Add wandb flag if disabled
+        if not enable_wandb:
+            command.append("--no-wandb")
+        
         success, output = self.run_command_with_progress(
             command,
-            f"Training MLP model ({epochs} epochs, batch size {batch_size})..."
+            f"Training MLP model ({epochs} epochs, batch size {batch_size}, wandb {'enabled' if enable_wandb else 'disabled'})..."
         )
         
         if success:
@@ -342,13 +440,37 @@ class AestheticaPipeline:
             config_path = Path(normalized_path) / "model_config.json"
             
             if model_path.exists() and config_path.exists():
+                # Parse validation visualization stats from output
+                viz_count = 0
+                viz_epochs = []
+                for line in output.split('\n'):
+                    if line.startswith('VALIDATION_VIZ_STATS:'):
+                        try:
+                            # Parse: "VALIDATION_VIZ_STATS: count=2, epochs=[0, 100]"
+                            parts = line.split(': ')[1]
+                            count_part = parts.split(', epochs=')[0]
+                            epochs_part = parts.split(', epochs=')[1]
+                            
+                            viz_count = int(count_part.split('=')[1])
+                            viz_epochs = eval(epochs_part)  # Safe since we control the input
+                        except Exception as e:
+                            console.print(f"Warning: Could not parse validation visualization stats: {e}")
+                
                 # Rich success panel with details
+                wandb_info = ""
+                if enable_wandb:
+                    wandb_info = "\n🎯 Training metrics logged to wandb dashboard"
+                    if viz_count > 0:
+                        epoch_list = ", ".join(map(str, viz_epochs))
+                        wandb_info += f"\n📸 Validation visualizations: {viz_count} (epochs: {epoch_list})"
+                
                 success_panel = Panel(
                     f"✅ [bold green]Model Trained Successfully![/bold green]\n\n"
                     f"🤖 Model File: [cyan]{model_path}[/cyan]\n"
                     f"⚙️  Config File: [cyan]{config_path}[/cyan]\n"
                     f"📊 Epochs: [yellow]{epochs}[/yellow] | Batch Size: [yellow]{batch_size}[/yellow]\n"
-                    f"📁 Dataset: [magenta]{Path(normalized_path).name}[/magenta]",
+                    f"📁 Dataset: [magenta]{Path(normalized_path).name}[/magenta]"
+                    f"{wandb_info}",
                     title="Step 3 Complete",
                     style="green",
                     box=box.DOUBLE
@@ -358,7 +480,9 @@ class AestheticaPipeline:
                 self.pipeline_status["model_training"] = {
                     "completed": True,
                     "time": datetime.now(),
-                    "output_path": str(model_path)
+                    "output_path": str(model_path),
+                    "validation_viz_count": viz_count,
+                    "validation_viz_epochs": viz_epochs
                 }
                 return True
             else:
@@ -458,7 +582,7 @@ class AestheticaPipeline:
     
     def run_full_pipeline(self, dataset_name: str, raw_path: str, 
                          clip_model: str = "ViT-B/32", epochs: int = 100, 
-                         batch_size: int = 32) -> bool:
+                         batch_size: int = 32, enable_wandb: bool = None) -> bool:
         """Run the complete pipeline for a dataset."""
         console.print(f"\n🚀 [bold magenta]Starting Full Pipeline for '{dataset_name}'[/bold magenta]")
         
@@ -473,7 +597,7 @@ class AestheticaPipeline:
             return False
         
         # Step 3: Train Model
-        if not self.train_model(str(normalized_path), epochs, batch_size):
+        if not self.train_model(str(normalized_path), epochs, batch_size, enable_wandb):
             return False
         
         # Step 4: Test Model
@@ -489,6 +613,10 @@ class AestheticaPipeline:
     def interactive_mode(self):
         """Run the pipeline in interactive mode."""
         self.display_banner()
+        
+        # Setup wandb first
+        console.print(f"\n🔧 [bold blue]Setup Configuration[/bold blue]")
+        enable_wandb = self.setup_wandb(ask_user=True)
         
         # Scan for datasets
         datasets = self.scan_datasets()
@@ -524,12 +652,22 @@ class AestheticaPipeline:
             epochs = int(Prompt.ask("Training Epochs", default="100"))
             batch_size = int(Prompt.ask("Batch Size", default="32"))
             
+            # Allow user to override wandb setting
+            if not self.wandb_enabled:
+                enable_wandb_override = Confirm.ask("Enable wandb logging for this run?", default=False)
+                if enable_wandb_override:
+                    enable_wandb = self.setup_wandb(ask_user=True)
+            else:
+                enable_wandb_override = not Confirm.ask("Disable wandb logging for this run?", default=False)
+                enable_wandb = enable_wandb_override
+            
             # Confirm and run
             console.print(f"\n📋 [bold yellow]Pipeline Configuration:[/bold yellow]")
             console.print(f"   Dataset: {selected_dataset['name']}")
             console.print(f"   CLIP Model: {clip_model}")
             console.print(f"   Epochs: {epochs}")
             console.print(f"   Batch Size: {batch_size}")
+            self.display_wandb_status() if not enable_wandb else console.print(f"   Wandb Logging: [green]✅ Enabled[/green]")
             
             if Confirm.ask("Start pipeline?", default=True):
                 self.run_full_pipeline(
@@ -537,7 +675,8 @@ class AestheticaPipeline:
                     selected_dataset['raw_path'],
                     clip_model, 
                     epochs, 
-                    batch_size
+                    batch_size,
+                    enable_wandb
                 )
             else:
                 console.print("👋 Pipeline cancelled")
@@ -557,6 +696,7 @@ Examples:
   %(prog)s                                    # Interactive mode
   %(prog)s --dataset tattoo --auto          # Run full pipeline for 'tattoo' dataset
   %(prog)s --dataset tattoo --csv-only      # Only generate CSV
+  %(prog)s --dataset tattoo --no-wandb      # Run without wandb logging
   %(prog)s --list-datasets                   # List available datasets
         """
     )
@@ -572,11 +712,20 @@ Examples:
     parser.add_argument("--epochs", type=int, default=100, help="Training epochs")
     parser.add_argument("--batch-size", type=int, default=32, help="Batch size")
     parser.add_argument("--project-root", help="Project root directory")
+    parser.add_argument("--no-wandb", action="store_true", help="Disable wandb logging")
+    parser.add_argument("--setup-wandb", action="store_true", help="Setup wandb API key and exit")
     
     args = parser.parse_args()
     
     # Initialize pipeline
     pipeline = AestheticaPipeline(args.project_root)
+    
+    # Handle wandb setup command
+    if args.setup_wandb:
+        pipeline.display_banner()
+        console.print(f"\n🔧 [bold blue]Wandb Setup Mode[/bold blue]")
+        pipeline.setup_wandb(ask_user=True)
+        return
     
     if args.list_datasets:
         pipeline.display_banner()
@@ -595,6 +744,12 @@ Examples:
         pipeline.display_banner()
         console.print(f"🎯 Processing dataset: [bold cyan]{args.dataset}[/bold cyan]")
         
+        # Determine wandb setting
+        if args.no_wandb:
+            enable_wandb = False
+        else:
+            enable_wandb = None  # Let pipeline decide based on configuration
+        
         normalized_path = pipeline.normalized_datasets_dir / args.dataset
         
         if args.csv_only:
@@ -602,7 +757,7 @@ Examples:
         elif args.embeddings_only:
             pipeline.generate_embeddings(str(normalized_path), args.clip_model)
         elif args.train_only:
-            pipeline.train_model(str(normalized_path), args.epochs, args.batch_size)
+            pipeline.train_model(str(normalized_path), args.epochs, args.batch_size, enable_wandb)
         elif args.test_only:
             pipeline.test_model(str(normalized_path))
         else:
@@ -612,7 +767,8 @@ Examples:
                 dataset['raw_path'],
                 args.clip_model, 
                 args.epochs, 
-                args.batch_size
+                args.batch_size,
+                enable_wandb
             )
     else:
         # Interactive mode
