@@ -6,4 +6,6 @@ open-clip-torch
 timm
 numpy>=1.21.0
 wandb>=0.15.0
-pytorch-lightning>=2.0.0 
+pytorch-lightning>=2.0.0
+matplotlib>=3.5.0
+seaborn>=0.11.0 

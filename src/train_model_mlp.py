@@ -680,6 +680,24 @@ def start_training(root_folder, database_file, train_from, clip_models, val_perc
             artifact.add_file(str(config_path))
             wandb_logger.experiment.log_artifact(artifact)
             print(">> Saved model artifacts to wandb")
+            
+            # Save wandb run info for testing to resume the same run
+            try:
+                wandb_run_info = {
+                    "run_id": wandb_logger.experiment.id,
+                    "project": wandb_logger.experiment.project,
+                    "name": wandb_logger.experiment.name,
+                    "tags": list(wandb_logger.experiment.tags) if wandb_logger.experiment.tags else []
+                }
+                
+                wandb_info_path = pathlib.Path(root_folder) / "wandb_run_info.json"
+                with open(wandb_info_path, 'w') as f:
+                    json.dump(wandb_run_info, f, indent=2)
+                print(f">> Saved wandb run info to {wandb_info_path} for testing continuation")
+                
+            except Exception as e:
+                print(f"WARNING: Failed to save wandb run info: {e}")
+                
         except Exception as e:
             print(f"WARNING: Failed to log artifacts to wandb: {e}")
     

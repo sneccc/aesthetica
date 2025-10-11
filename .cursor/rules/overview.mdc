@@ -1,0 +1,154 @@
+---
+description: 
+globs: 
+alwaysApply: false
+---
+# Aesthetica ML Training Pipeline - Cursor Rules
+
+## Project Overview
+This is the **Aesthetica ML Training Pipeline** - a comprehensive machine learning workflow for image classification using CLIP embeddings and Multi-Layer Perceptron (MLP) models. The pipeline processes raw image datasets through embedding generation to trained model deployment.
+
+## Project Structure
+```
+aesthetica/
+├── src/                          # Main source code
+│   ├── train_model_mlp.py       # Core MLP training script with SimpleDashboard
+│   ├── data_to_csv.py           # Raw image dataset → CSV conversion
+│   ├── dataset_to_embeddings.py # CSV → CLIP embeddings generation
+│   ├── test_model.py            # Model evaluation and testing
+│   └── wandb_utils.py           # Wandb integration utilities
+├── datasets/
+│   ├── raw/                     # Raw image datasets (organized by class folders)
+│   └── normalized/              # Processed datasets with embeddings
+├── pipeline_cli.py              # Rich CLI interface for full pipeline
+└── .cursorrules                 # This file
+```
+
+## Key Technologies & Dependencies
+- **PyTorch Lightning**: Training framework with callbacks and loggers
+- **OpenCLIP**: CLIP model implementations (especially SigLIP variants)
+- **Wandb**: Experiment tracking with image visualization
+- **Rich**: Beautiful CLI interfaces and progress displays
+- **NumPy/Pandas**: Data processing
+- **PIL**: Image processing
+- **Windows Compatible**: All Unicode issues resolved (ASCII-only outputs)
+
+## Core Components
+
+### 1. MultiLayerPerceptron (train_model_mlp.py)
+- PyTorch Lightning module with configurable hidden layers
+- Default architecture: (4096, 1024, 512, 128) → num_classes
+- Metrics: Accuracy, F1, Precision, Recall (train/val)
+- Validation visualization every 5 epochs (epochs 0, 5, 10, 15...)
+- SimpleDashboard for real-time training feedback
+- Multiple optimizers: Lion (default), Adam, Prodigy, Lamb
+
+### 2. Pipeline Workflow
+1. **CSV Generation**: Raw images → structured CSV with labels
+2. **Embedding Generation**: Images → CLIP embeddings (.npy files)
+3. **Model Training**: Embeddings → trained MLP model
+4. **Model Testing**: Evaluation on test set
+
+### 3. CLI Interfaces
+- **pipeline_cli.py**: Rich spinner interface, disables dashboard (--no-dashboard)
+- **Direct script**: Full ASCII dashboard with real-time metrics
+- **Execution methods**:
+  ```bash
+  # Pipeline CLI (Rich spinner)
+  python pipeline_cli.py --dataset tattoo --train-only --epochs 120
+  
+  # Direct script (ASCII dashboard)
+  python src/train_model_mlp.py -i datasets/normalized/tattoo --epochs 120
+  ```
+
+### 4. SimpleDashboard Class
+- ASCII-only progress bars (#/- characters)
+- Displays: epoch progress, timing, metrics table, learning rate, system stats
+- Prints every validation epoch (every 5 epochs)
+- Safety checks for PyTorch Lightning sanity checking
+- Status indicators: DOWN/UP/WAIT, GOOD/OK/TRAIN, GREAT/GOOD/TRAIN
+
+## CLIP Models & Configurations
+**Primary Model**: `"hf-hub:timm", "ViT-SO400M-14-SigLIP-384"`
+- High-quality SigLIP variant with 384px resolution
+- Other supported: ViT-B/32, ViT-L/14, various SigLIP models
+- Embedding dimensions automatically detected via `open_clip.get_model_config()`
+
+## Wandb Integration
+- **Project Name**: "aesthetica-training"
+- **Validation Visualization**: Image predictions logged every 25 epochs OR every 5 validation runs
+- **Metrics Logged**: All training/validation metrics, learning rate, model checkpoints
+- **Image Tables**: Shows actual images, true/predicted labels, confidence scores
+- **API Key Management**: Stored in project root, interactive setup available
+
+## Training Configuration
+- **Validation Frequency**: Every 5 epochs (check_val_every_n_epoch=5)
+- **Visualization Frequency**: Epochs 0, 5, 10, 15, 20, 25, etc.
+- **Early Stopping**: 50 epochs patience on val_recall
+- **Default Batch Size**: 256 (training), 32 (CLI)
+- **Train/Val Split**: 75/25 with stratification when possible
+
+## File Formats & Data Structure
+- **CSV Schema**: image_path, image_name, label_name, label_id, embedding_index
+- **Embeddings**: .npy files with shape (n_samples, embedding_dim)
+- **Model Files**: model.pth (state_dict) + model_config.json (metadata)
+- **Debug Files**: validation_debug.txt (validation run tracking)
+
+## Windows Compatibility Notes
+- **Encoding**: All Unicode characters replaced with ASCII (✓→OK, █→#, etc.)
+- **Emojis**: Converted to text equivalents (">> Simple dashboard enabled!")
+- **Progress Bars**: Use #/- instead of █/░
+- **Status Indicators**: ASCII-only symbols throughout
+
+## Development Patterns
+
+### Error Handling
+- Graceful degradation for missing dependencies (psutil, GPUtil)
+- Try/except blocks for wandb operations
+- Validation setup error checking with test methods
+- Windows encoding error prevention
+
+### Code Style
+- Type hints for function parameters
+- Dataclasses for configuration objects
+- Rich formatting for CLI outputs
+- Lightning callbacks for training lifecycle
+
+### Testing & Validation
+- `test_validation_visualization_setup()` method for debugging
+- Debug file logging for validation run tracking
+- Validation visualization statistics parsing in CLI
+
+## Common Operations
+
+### Adding New Dataset
+1. Place in `datasets/raw/dataset_name/` with class subfolders
+2. Run: `python pipeline_cli.py --dataset dataset_name --auto`
+
+### Training Existing Dataset
+```bash
+# With Rich spinner (pipeline)
+python pipeline_cli.py --dataset tattoo --train-only --epochs 120
+
+# With ASCII dashboard (direct)
+python src/train_model_mlp.py -i datasets/normalized/tattoo --epochs 120
+```
+
+### Debugging Validation Visualization
+- Check `validation_debug.txt` in dataset folder
+- Use `net.test_validation_visualization_setup(trainer)` method
+- Ensure wandb logger is properly configured
+
+## Important Notes
+- **Dashboard Conflicts**: Pipeline CLI uses --no-dashboard to avoid Rich spinner conflicts
+- **Validation Timing**: Fixed to run every 5 epochs (was only epoch 0)
+- **Model Checkpointing**: Monitors val_recall for best model selection
+- **System Monitoring**: Optional GPU/CPU usage display if libraries available
+
+## Recent Issues Resolved
+1. ✅ Validation visualization only at epoch 0 → Now every 5 epochs
+2. ✅ Unicode encoding errors on Windows → Full ASCII compatibility
+3. ✅ Dashboard interference with CLI → Separate execution modes
+4. ✅ SimpleDashboard not defined → Proper class organization
+
+5. ✅ Sanity check errors → Safety checks added 

@@ -416,6 +416,7 @@ class AestheticaPipeline:
         training_table.add_row("Wandb Logging", f"[{'green' if enable_wandb else 'yellow'}]{'Enabled' if enable_wandb else 'Disabled'}[/{'green' if enable_wandb else 'yellow'}]")
         training_table.add_row("Model Output", str(Path(normalized_path) / "model.pth"))
         training_table.add_row("Config Output", str(Path(normalized_path) / "model_config.json"))
+        training_table.add_row("Dashboard", "[green]✅ Enabled (Live Training Metrics)[/green]")
         console.print(training_table)
         
         command = [
@@ -430,39 +431,37 @@ class AestheticaPipeline:
         if not enable_wandb:
             command.append("--no-wandb")
         
-        success, output = self.run_command_with_progress(
-            command,
-            f"Training MLP model ({epochs} epochs, batch size {batch_size}, wandb {'enabled' if enable_wandb else 'disabled'})..."
-        )
+        # Note: Removed --no-dashboard to allow the beautiful training dashboard to show
+        
+        console.print(f"\n🚀 [bold green]Starting training with live dashboard...[/bold green]")
+        console.print(f"[dim]The training dashboard will show live metrics below.[/dim]\n")
+        
+        # Run training without progress spinner to avoid conflicts with the training dashboard
+        try:
+            process = subprocess.Popen(
+                command,
+                cwd=self.project_root,
+                text=True
+            )
+            
+            # Wait for completion and get return code
+            return_code = process.wait()
+            success = return_code == 0
+            
+        except Exception as e:
+            success = False
+            console.print(f"❌ [bold red]Training failed with error: {str(e)}[/bold red]")
+            return False
         
         if success:
             model_path = Path(normalized_path) / "model.pth"
             config_path = Path(normalized_path) / "model_config.json"
             
             if model_path.exists() and config_path.exists():
-                # Parse validation visualization stats from output
-                viz_count = 0
-                viz_epochs = []
-                for line in output.split('\n'):
-                    if line.startswith('VALIDATION_VIZ_STATS:'):
-                        try:
-                            # Parse: "VALIDATION_VIZ_STATS: count=2, epochs=[0, 100]"
-                            parts = line.split(': ')[1]
-                            count_part = parts.split(', epochs=')[0]
-                            epochs_part = parts.split(', epochs=')[1]
-                            
-                            viz_count = int(count_part.split('=')[1])
-                            viz_epochs = eval(epochs_part)  # Safe since we control the input
-                        except Exception as e:
-                            console.print(f"Warning: Could not parse validation visualization stats: {e}")
-                
                 # Rich success panel with details
                 wandb_info = ""
                 if enable_wandb:
                     wandb_info = "\n🎯 Training metrics logged to wandb dashboard"
-                    if viz_count > 0:
-                        epoch_list = ", ".join(map(str, viz_epochs))
-                        wandb_info += f"\n📸 Validation visualizations: {viz_count} (epochs: {epoch_list})"
                 
                 success_panel = Panel(
                     f"✅ [bold green]Model Trained Successfully![/bold green]\n\n"
@@ -480,9 +479,7 @@ class AestheticaPipeline:
                 self.pipeline_status["model_training"] = {
                     "completed": True,
                     "time": datetime.now(),
-                    "output_path": str(model_path),
-                    "validation_viz_count": viz_count,
-                    "validation_viz_epochs": viz_epochs
+                    "output_path": str(model_path)
                 }
                 return True
             else:
@@ -490,12 +487,15 @@ class AestheticaPipeline:
                 return False
         else:
             console.print(f"❌ [bold red]Model training failed[/bold red]")
-            console.print(Panel(output, title="Error Output", style="red"))
             return False
     
-    def test_model(self, normalized_path: str) -> bool:
+    def test_model(self, normalized_path: str, enable_wandb: bool = None) -> bool:
         """Test the trained model."""
         console.print(f"\n🔄 [bold blue]Step 4: Testing model[/bold blue]")
+        
+        # Use wandb setting from training if not specified
+        if enable_wandb is None:
+            enable_wandb = self.wandb_enabled
         
         # Display test configuration with rich formatting
         test_table = Table(title="🧪 Model Testing Configuration", box=box.ROUNDED)
@@ -505,13 +505,19 @@ class AestheticaPipeline:
         test_table.add_row("Config File", str(Path(normalized_path) / "model_config.json"))
         test_table.add_row("Test Data", str(Path(normalized_path) / "image_classifier_data.csv"))
         test_table.add_row("Dataset", f"[magenta]{Path(normalized_path).name}[/magenta]")
+        test_table.add_row("Wandb Logging", f"[{'green' if enable_wandb else 'yellow'}]{'Enabled (Confusion Matrix)' if enable_wandb else 'Disabled'}[/{'green' if enable_wandb else 'yellow'}]")
         console.print(test_table)
         
         command = [
             sys.executable,
             str(self.scripts_dir / "test_model.py"),
-            "-i", normalized_path
+            "-i", normalized_path,
+            "--publication-plots"  # Enable by default
         ]
+        
+        # Add wandb flag if enabled (will auto-detect existing run)
+        if enable_wandb:
+            command.append("--wandb")
         
         success, output = self.run_command_with_progress(
             command,
@@ -520,11 +526,16 @@ class AestheticaPipeline:
         
         if success:
             # Rich success panel with details
+            wandb_info = ""
+            if enable_wandb:
+                wandb_info = "\n🎯 Confusion matrix logged to wandb dashboard"
+            
             success_panel = Panel(
                 f"✅ [bold green]Model Testing Completed![/bold green]\n\n"
                 f"📊 Test Results Available Below\n"
                 f"🎯 Dataset: [magenta]{Path(normalized_path).name}[/magenta]\n"
-                f"📁 Model: [cyan]{Path(normalized_path) / 'model.pth'}[/cyan]",
+                f"📁 Model: [cyan]{Path(normalized_path) / 'model.pth'}[/cyan]"
+                f"{wandb_info}",
                 title="Step 4 Complete",
                 style="green",
                 box=box.DOUBLE
@@ -584,24 +595,44 @@ class AestheticaPipeline:
                          clip_model: str = "ViT-B/32", epochs: int = 100, 
                          batch_size: int = 32, enable_wandb: bool = None) -> bool:
         """Run the complete pipeline for a dataset."""
-        console.print(f"\n🚀 [bold magenta]Starting Full Pipeline for '{dataset_name}'[/bold magenta]")
+        return self.run_partial_pipeline(dataset_name, raw_path, clip_model, epochs, batch_size, enable_wandb, "csv")
+    
+    def run_partial_pipeline(self, dataset_name: str, raw_path: str, 
+                           clip_model: str = "ViT-B/32", epochs: int = 100, 
+                           batch_size: int = 32, enable_wandb: bool = None,
+                           start_from: str = "csv") -> bool:
+        """Run the pipeline starting from a specific stage.
+        
+        Args:
+            dataset_name: Name of the dataset
+            raw_path: Path to raw dataset
+            clip_model: CLIP model to use
+            epochs: Number of training epochs
+            batch_size: Training batch size
+            enable_wandb: Whether to enable wandb logging
+            start_from: Stage to start from ('csv', 'embeddings', 'train', 'test')
+        """
+        console.print(f"\n🚀 [bold magenta]Starting Pipeline for '{dataset_name}' from '{start_from}' stage[/bold magenta]")
         
         normalized_path = self.normalized_datasets_dir / dataset_name
         
-        # Step 1: Generate CSV
-        if not self.generate_csv(dataset_name, raw_path):
-            return False
+        # Step 1: Generate CSV (if needed)
+        if start_from in ["csv"]:
+            if not self.generate_csv(dataset_name, raw_path):
+                return False
         
-        # Step 2: Generate Embeddings
-        if not self.generate_embeddings(str(normalized_path), clip_model):
-            return False
+        # Step 2: Generate Embeddings (if needed)
+        if start_from in ["csv", "embeddings"]:
+            if not self.generate_embeddings(str(normalized_path), clip_model):
+                return False
         
-        # Step 3: Train Model
-        if not self.train_model(str(normalized_path), epochs, batch_size, enable_wandb):
-            return False
+        # Step 3: Train Model (if needed)
+        if start_from in ["csv", "embeddings", "train"]:
+            if not self.train_model(str(normalized_path), epochs, batch_size, enable_wandb):
+                return False
         
         # Step 4: Test Model
-        if not self.test_model(str(normalized_path)):
+        if not self.test_model(str(normalized_path), enable_wandb):
             return False
         
         # Display summary
@@ -645,6 +676,69 @@ class AestheticaPipeline:
             selected_dataset = datasets[selection]
             console.print(f"✅ Selected dataset: [bold cyan]{selected_dataset['name']}[/bold cyan]")
             
+            # Handle trained datasets differently
+            if selected_dataset['stage'] == 'trained':
+                console.print(f"\n🎯 [bold green]This dataset is already trained![/bold green]")
+                console.print(f"🤔 [bold yellow]What would you like to do?[/bold yellow]")
+                
+                action_choices = [
+                    "1. Test the existing model",
+                    "2. Retrain the model (override existing)",
+                    "3. Regenerate embeddings and retrain",
+                    "4. Regenerate CSV, embeddings and retrain (full pipeline)",
+                    "5. Cancel"
+                ]
+                
+                for choice in action_choices:
+                    console.print(f"   {choice}")
+                
+                action_selection = int(Prompt.ask("Enter your choice", default="1")) - 1
+                
+                if action_selection == 0:  # Test only
+                    console.print(f"\n🧪 [bold blue]Testing existing model...[/bold blue]")
+                    
+                    # Allow user to override wandb setting for testing
+                    if not self.wandb_enabled:
+                        enable_wandb_override = Confirm.ask("Enable wandb logging for testing?", default=False)
+                        if enable_wandb_override:
+                            enable_wandb = self.setup_wandb(ask_user=True)
+                    else:
+                        enable_wandb_override = not Confirm.ask("Disable wandb logging for testing?", default=False)
+                        enable_wandb = enable_wandb_override
+                    
+                    normalized_path = self.normalized_datasets_dir / selected_dataset['name']
+                    self.test_model(str(normalized_path), enable_wandb)
+                    return
+                    
+                elif action_selection == 1:  # Retrain only
+                    console.print(f"\n🔄 [bold yellow]Retraining model (keeping existing embeddings)...[/bold yellow]")
+                    run_from_stage = "train"
+                    
+                elif action_selection == 2:  # Regenerate embeddings and retrain
+                    console.print(f"\n🔄 [bold yellow]Regenerating embeddings and retraining...[/bold yellow]")
+                    run_from_stage = "embeddings"
+                    
+                elif action_selection == 3:  # Full pipeline
+                    console.print(f"\n🔄 [bold yellow]Running full pipeline (regenerating everything)...[/bold yellow]")
+                    run_from_stage = "csv"
+                    
+                elif action_selection == 4:  # Cancel
+                    console.print("👋 Operation cancelled")
+                    return
+                    
+                else:
+                    console.print("❌ [bold red]Invalid selection[/bold red]")
+                    return
+                    
+            else:
+                # For non-trained datasets, run from appropriate stage
+                if selected_dataset['stage'] == 'needs_csv':
+                    run_from_stage = "csv"
+                elif selected_dataset['stage'] == 'needs_embeddings':
+                    run_from_stage = "embeddings"
+                elif selected_dataset['stage'] == 'ready_to_train':
+                    run_from_stage = "train"
+            
             # Get pipeline parameters
             console.print(f"\n⚙️  [bold yellow]Configure Pipeline Parameters:[/bold yellow]")
             
@@ -667,16 +761,18 @@ class AestheticaPipeline:
             console.print(f"   CLIP Model: {clip_model}")
             console.print(f"   Epochs: {epochs}")
             console.print(f"   Batch Size: {batch_size}")
+            console.print(f"   Training Dashboard: [green]✅ Live Metrics Enabled[/green]")
             self.display_wandb_status() if not enable_wandb else console.print(f"   Wandb Logging: [green]✅ Enabled[/green]")
             
             if Confirm.ask("Start pipeline?", default=True):
-                self.run_full_pipeline(
+                self.run_partial_pipeline(
                     selected_dataset['name'], 
                     selected_dataset['raw_path'],
                     clip_model, 
                     epochs, 
                     batch_size,
-                    enable_wandb
+                    enable_wandb,
+                    run_from_stage
                 )
             else:
                 console.print("👋 Pipeline cancelled")
@@ -693,11 +789,18 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  %(prog)s                                    # Interactive mode
+  %(prog)s                                    # Interactive mode with dashboard
   %(prog)s --dataset tattoo --auto          # Run full pipeline for 'tattoo' dataset
   %(prog)s --dataset tattoo --csv-only      # Only generate CSV
+  %(prog)s --dataset tattoo --from-stage train  # Start from training stage (skip CSV/embeddings)
   %(prog)s --dataset tattoo --no-wandb      # Run without wandb logging
   %(prog)s --list-datasets                   # List available datasets
+
+Features:
+  - Beautiful live training dashboard with real-time metrics
+  - Wandb integration for experiment tracking  
+  - Complete pipeline automation from raw images to trained model
+  - Smart handling of trained datasets with override options
         """
     )
     
@@ -707,6 +810,7 @@ Examples:
     parser.add_argument("--embeddings-only", action="store_true", help="Only generate embeddings")
     parser.add_argument("--train-only", action="store_true", help="Only train model")
     parser.add_argument("--test-only", action="store_true", help="Only test model")
+    parser.add_argument("--from-stage", choices=["csv", "embeddings", "train"], help="Start pipeline from specific stage")
     parser.add_argument("--list-datasets", "-l", action="store_true", help="List available datasets")
     parser.add_argument("--clip-model", default="ViT-SO400M-14-SigLIP-384", help="CLIP model to use")
     parser.add_argument("--epochs", type=int, default=100, help="Training epochs")
@@ -759,7 +863,18 @@ Examples:
         elif args.train_only:
             pipeline.train_model(str(normalized_path), args.epochs, args.batch_size, enable_wandb)
         elif args.test_only:
-            pipeline.test_model(str(normalized_path))
+            pipeline.test_model(str(normalized_path), enable_wandb)
+        elif args.from_stage:
+            # Run partial pipeline from specified stage
+            pipeline.run_partial_pipeline(
+                args.dataset, 
+                dataset['raw_path'],
+                args.clip_model, 
+                args.epochs, 
+                args.batch_size,
+                enable_wandb,
+                args.from_stage
+            )
         else:
             # Full pipeline
             pipeline.run_full_pipeline(
